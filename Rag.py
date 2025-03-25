@@ -1,325 +1,342 @@
-"""
-Hybrid RAG Implementation
--------------------------
-This script demonstrates a complete implementation of a hybrid RAG system
-using multiple embedding models for optimal retrieval performance.
-Processes PDF documents from a local path and indexes them with metadata
-including page numbers for source tracking.
-"""
+"""BestRAG with Local Persistence"""
+# Authors: Abdul Samad Siddiqui <abdulsamadsid1@gmail.com>
 
-import os
 import re
-from typing import List, Dict, Any
-from pathlib import Path
+import uuid
+import os
+from typing import List, Optional
+from qdrant_client import QdrantClient, models
+from qdrant_client.http.models import Distance
+from fastembed import TextEmbedding
+from fastembed.sparse.bm25 import Bm25
+import PyPDF2
 
-# PDF processing
-import fitz  # PyMuPDF
 
-from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct
-import qdrant_client.models as models
-from fastembed import TextEmbedding, LateInteractionTextEmbedding, SparseTextEmbedding
+class BestRAG:
+    """
+    BestRAG (Best Retrieval Augmented by Qdrant) is a class that provides
+    functionality for storing and searching document embeddings in a Qdrant
+    vector database.
 
-# Initialize client with local persistence
-client = QdrantClient(path="./qdrant_storage")  # Local persistence
+    It supports both dense and sparse embeddings, as well as a late interaction
+    model for improved retrieval performance.
 
-def setup_collection(collection_name: str = "hybrid-search"):
+    Args:
+        path (str): The local path for Qdrant persistence.
+        collection_name (str): The name of the Qdrant collection to use.
+        late_interaction_model_name (Optional[str]): The name of the late
+            interaction model to use. Defaults to "BAAI/bge-small-en-v1.5".
     """
-    Create a collection with the necessary vector configurations
-    """
-    # Check if collection exists and delete if it does
-    collections = client.get_collections().collections
-    if any(collection.name == collection_name for collection in collections):
-        client.delete_collection(collection_name)
-    
-    # Create a new collection with vector configurations for all embedding types
-    client.create_collection(
-        collection_name=collection_name,
-        vectors_config={
-            "all-MiniLM-L6-v2": models.VectorParams(
-                size=384,  # Dimension of all-MiniLM-L6-v2
-                distance=models.Distance.COSINE,
-            ),
-            "bm25": models.VectorParams(
-                size=32_768,  # Common sparse vector dimension
-                distance=models.Distance.DOT,
-            ),
-            "colbertv2.0": models.VectorParams(
-                size=128,  # Dimension of colbertv2.0
-                distance=models.Distance.COSINE,
-            ),
-        },
-    )
-    print(f"Collection '{collection_name}' created successfully")
 
-def load_embedding_models():
-    """
-    Load all required embedding models
-    """
-    # Load dense embedding model for semantic understanding
-    dense_embedding_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
-    
-    # Load sparse embedding model for keyword matching
-    bm25_embedding_model = SparseTextEmbedding("Qdrant/bm25")
-    
-    # Load late interaction embedding model for contextual precision
-    late_interaction_embedding_model = LateInteractionTextEmbedding("colbert-ir/colbertv2.0")
-    
-    return dense_embedding_model, bm25_embedding_model, late_interaction_embedding_model
+    def __init__(self,
+                 path: str,
+                 collection_name: str,
+                 late_interaction_model_name: Optional[str] = "BAAI/bge-small-en-v1.5"
+                 ):
+        self.collection_name = collection_name
+        self.path = path
+        
+        # Create directory for persistence if it doesn't exist
+        os.makedirs(path, exist_ok=True)
+        
+        # Initialize local Qdrant client with persistence
+        self.client = QdrantClient(path=path)
 
-def extract_text_from_pdf(pdf_path):
-    """
-    Extract text from PDF along with page numbers and title only
-    """
-    document = fitz.open(pdf_path)
-    chunks = []
-    
-    # Get only the title from metadata
-    title = document.metadata.get("title", "Unknown")
-    if title == "Unknown" or not title.strip():
-        # Use filename as title if no title metadata
-        title = Path(pdf_path).stem
-    
-    for page_num, page in enumerate(document):
-        text = page.get_text()
-        # Skip nearly empty pages
-        if len(text) > 10:  # Only include non-empty pages
-            chunks.append({
-                "content": text,
-                "page_num": page_num + 1,  # 1-based page numbering
-                "title": title
-            })
-    
-    return chunks
+        self.dense_model = TextEmbedding()
+        self.late_interaction_model = TextEmbedding(
+            late_interaction_model_name)
+        self.sparse_model = Bm25("Qdrant/bm25")
 
-def process_pdf_directory(pdf_dir, 
-                        dense_model, 
-                        bm25_model, 
-                        late_model, 
-                        collection_name: str = "hybrid-search"):
-    """
-    Process all PDFs in a directory and index them with metadata
-    """
-    all_chunks = []
-    pdf_files = list(Path(pdf_dir).glob("*.pdf"))
-    
-    print(f"Found {len(pdf_files)} PDF files in {pdf_dir}")
-    
-    for pdf_path in pdf_files:
-        print(f"Processing {pdf_path.name}...")
-        chunks = extract_text_from_pdf(str(pdf_path))
-        all_chunks.extend(chunks)
-    
-    print(f"Extracted {len(all_chunks)} text chunks from PDFs")
-    
-    # Generate document texts for embedding
-    documents = [chunk["content"] for chunk in all_chunks]
-    
-    # Generate embeddings for all documents
-    print("Generating dense embeddings...")
-    dense_embeddings = list(dense_model.embed(documents))
-    
-    print("Generating BM25 sparse embeddings...")
-    bm25_embeddings = list(bm25_model.embed(documents))
-    
-    print("Generating late interaction embeddings...")
-    late_interaction_embeddings = list(late_model.embed(documents))
-    
-    # Create points with all embeddings and simplified metadata
-    print("Creating points with all embeddings and simplified metadata...")
-    points = []
-    for idx, (dense_embedding, bm25_embedding, late_interaction_embedding, chunk) in enumerate(
-        zip(dense_embeddings, bm25_embeddings, late_interaction_embeddings, all_chunks)
-    ):
-        point = PointStruct(
-            id=idx,
-            vector={
-                "all-MiniLM-L6-v2": dense_embedding,
-                "bm25": bm25_embedding.as_object(),
-                "colbertv2.0": late_interaction_embedding,
-            },
-            payload={
-                "content": chunk["content"],
-                "page_num": chunk["page_num"],
-                "title": chunk["title"],
-                "filename": Path(pdf_path).name  # Keep just the filename
+        self._create_or_use_collection()
+
+    def _create_or_use_collection(self):
+        """
+        Create a new Qdrant collection if it doesn't exist, or use an existing one.
+        """
+        collections = self.client.get_collections()
+        collection_names = [
+            collection.name for collection in collections.collections]
+
+        if self.collection_name not in collection_names:
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "dense-vector": models.VectorParams(
+                        size=384,
+                        distance=Distance.COSINE
+                    ),
+                    "output-token-embeddings": models.VectorParams(
+                        size=384,
+                        distance=Distance.COSINE,
+                        multivector_config=models.MultiVectorConfig(
+                            comparator=models.MultiVectorComparator.MAX_SIM
+                        )
+                    ),
+                },
+                sparse_vectors_config={"sparse": models.SparseVectorParams()}
+            )
+            print(f"Created collection: {self.collection_name}")
+        else:
+            print(f"Using existing collection: {self.collection_name}")
+
+    def _clean_text(self, text: str) -> str:
+        """
+        Clean the input text by removing special characters and formatting.
+
+        Args:
+            text (str): The text to be cleaned.
+
+        Returns:
+            str: The cleaned text.
+        """
+        text = re.sub(r'_+', '', text)
+        text = text.replace('\n', ' ')
+        text = re.sub(r'\s{2,}', ' ', text)
+        text = re.sub(r'(\d+\.)\s', r'\n\1 ', text)
+        text = re.sub(r'[●■○]', '', text)
+        text = re.sub(r'[""''«»]', '"', text)
+        text = re.sub(r'[–—−]', '-', text)
+        text = re.sub(r'[^\x00-\x7F]+', '', text)
+        text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
+        text = re.sub(r'\s+', ' ', text)
+
+        return text.strip()
+
+    def _get_dense_embedding(self, text: str):
+        """
+        Get the dense embedding for the given text.
+
+        Args:
+            text (str): The text to be embedded.
+
+        Returns:
+            List[float]: The dense embedding vector.
+        """
+        return list(self.dense_model.embed([text]))[0]
+
+    def _get_late_interaction_embedding(self, text: str):
+        """
+        Get the late interaction embedding for the given text.
+
+        Args:
+            text (str): The text to be embedded.
+
+        Returns:
+            List[float]: The late interaction embedding vector.
+        """
+        return list(self.late_interaction_model.embed([text]))[0]
+
+    def _get_sparse_embedding(self, text: str):
+        """
+        Get the sparse embedding for the given text.
+
+        Args:
+            text (str): The text to be embedded.
+
+        Returns:
+            models.SparseVector: The sparse embedding vector.
+        """
+        return next(self.sparse_model.embed(text))
+
+    def _extract_pdf_text_per_page(self, pdf_path: str) -> List[str]:
+        """
+        Load a PDF file and extract the text from each page.
+
+        Args:
+            pdf_path (str): The path to the PDF file.
+
+        Returns:
+            List[str]: The text from each page of the PDF.
+        """
+        with open(pdf_path, "rb") as pdf_file:
+            reader = PyPDF2.PdfReader(pdf_file)
+            return [page.extract_text() for page in reader.pages]
+
+    def store_pdf_embeddings(self, pdf_path: str,
+                             pdf_name: str,
+                             metadata: Optional[dict] = None):
+        """
+        Store the embeddings for each page of a PDF file in the Qdrant collection.
+
+        Args:
+            pdf_path (str): The path to the PDF file.
+            pdf_name (str): The name of the PDF file.
+            metadata (Optional[dict]): Additional metadata to store with each embedding.
+        """
+        texts = self._extract_pdf_text_per_page(pdf_path)
+
+        for page_num, text in enumerate(texts):
+            clean_text = self._clean_text(text)
+            dense_embedding = self._get_dense_embedding(clean_text)
+            late_interaction_embedding = self._get_late_interaction_embedding(
+                clean_text)
+            sparse_embedding = self._get_sparse_embedding(clean_text)
+
+            hybrid_vector = {
+                "dense-vector": dense_embedding,
+                "output-token-embeddings": late_interaction_embedding,
+                "sparse": models.SparseVector(
+                    indices=sparse_embedding.indices,
+                    values=sparse_embedding.values,
+                )
             }
+
+            payload = {
+                "text": clean_text,
+                "page_number": page_num + 1,
+                "pdf_name": pdf_name
+            }
+
+            if metadata:
+                payload.update(metadata)
+
+            point = models.PointStruct(
+                id=str(uuid.uuid4()),
+                vector=hybrid_vector,
+                payload=payload
+            )
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=[point]
+            )
+
+            print(f"Stored embedding for page {page_num + 1} of '{pdf_name}' in collection '{self.collection_name}'.")
+
+    def delete_pdf_embeddings(self, pdf_name: str):
+        """
+        Delete all embeddings associated with a given PDF name from the Qdrant collection.
+
+        Args:
+            pdf_name (str): The name of the PDF file whose embeddings should be deleted.
+        """
+        filter_ = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="pdf_name",
+                    match=models.MatchValue(value=pdf_name)
+                )
+            ]
         )
-        points.append(point)
-    
-    # Upload points to the collection
-    print(f"Uploading {len(points)} points to collection '{collection_name}'...")
-    operation_info = client.upsert(
-        collection_name=collection_name,
-        points=points
-    )
-    
-    print(f"Documents processed and stored. Operation ID: {operation_info.operation_id}")
-    return operation_info
 
-def hybrid_search(query: str, 
-                 dense_model, 
-                 bm25_model, 
-                 late_model, 
-                 collection_name: str = "hybrid-search", 
-                 limit: int = 10):
-    """
-    Perform hybrid search using all three embedding types
-    """
-    print(f"Searching for: '{query}'")
-    
-    # Generate query embeddings
-    dense_vectors = next(dense_model.query_embed(query))
-    sparse_vectors = next(bm25_model.query_embed(query))
-    late_vectors = next(late_model.query_embed(query))
-    
-    # Set up prefetch parameter for hybrid search
-    prefetch = [
-        models.Prefetch(
-            query=dense_vectors,
-            using="all-MiniLM-L6-v2",
-            limit=20,
-        ),
-        models.Prefetch(
-            query=models.SparseVector(**sparse_vectors.as_object()),
-            using="bm25",
-            limit=20,
-        ),
-    ]
-    
-    # Execute search with re-ranking
-    results = client.query_points(
-        collection_name,
-        prefetch=prefetch,
-        query=late_vectors,
-        using="colbertv2.0",
-        with_payload=True,
-        limit=limit,
-    )
-    
-    return results
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(
+                filter=filter_
+            )
+        )
 
-def format_context_from_results(results):
-    """
-    Format search results into context for LLM with simplified source information
-    """
-    context = ""
-    sources = []
-    
-    for i, result in enumerate(results):
-        content = result.payload.get("content", "")
-        page_num = result.payload.get("page_num", "?")
-        title = result.payload.get("title", "Unknown")
-        filename = result.payload.get("filename", "Unknown")
-        score = result.score
-        
-        # Add formatted content
-        context += f"\n[CONTENT {i+1}] {content}\n"
-        
-        # Track source with simplified information
-        source = {
-            "title": title,
-            "filename": filename,
-            "page_num": page_num,
-            "score": round(score, 4),
-            "content_snippet": content[:100] + "..." if len(content) > 100 else content
+        print(f"Deleted all embeddings for PDF '{pdf_name}' from collection '{self.collection_name}'.")
+
+    def search(self, query: str, limit: int = 10):
+        """
+        Search the Qdrant collection for documents that match the given query.
+
+        Args:
+            query (str): The search query.
+            limit (int): The maximum number of results to return. Defaults to 10.
+
+        Returns:
+            List[models.SearchResult]: The search results.
+        """
+        clean_query = self._clean_text(query)
+        dense_query = self._get_dense_embedding(clean_query)
+        late_interaction_query = self._get_late_interaction_embedding(
+            clean_query)
+        sparse_query = self._get_sparse_embedding(clean_query)
+
+        query_vector = {
+            "dense-vector": dense_query,
+            "output-token-embeddings": late_interaction_query,
+            "sparse": {
+                "indices": sparse_query.indices,
+                "values": sparse_query.values,
+            }
         }
-        sources.append(source)
-    
-    return context, sources
 
-def generate_response(query, context, sources):
-    """
-    Generate response using external LLM function
-    """
-    # Construct prompt with context
-    prompt = f"""
-Please answer the following question based only on the provided context:
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            prefetch=[
+                models.Prefetch(
+                    query=query_vector["dense-vector"],
+                    using="dense-vector",
+                    limit=20,
+                )
+            ],
+            query=query_vector["output-token-embeddings"],
+            using="output-token-embeddings",
+            limit=limit,
+        )
 
-QUESTION: {query}
+        return results
 
-CONTEXT:
-{context}
+    def __str__(self):
+        """
+        Return a string representation of the BestRAG object, including its parameters.
+        """
+        info = (
+            "**************************************************\n"
+            "* BestRAG Object Information                     *\n"
+            "**************************************************\n"
+            f"* Path: {self.path}\n"
+            f"* Collection Name: {self.collection_name}\n"
+            "**************************************************"
+        )
+        return info
 
-Provide a comprehensive answer using only the information in the context.
-"""
-    
-    # Using the external abc_response function as requested
-    # Note: This function should be defined elsewhere
-    llm_response = abc_response(prompt)
-    
-    return llm_response, sources
-
-def abc_response(prompt):
-    """
-    Placeholder for external LLM function
-    This would be replaced by the actual function provided elsewhere
-    """
-    # Normally this would call the external LLM API
-    # For this implementation, we're just leaving it as a placeholder
-    return "This is a placeholder for the LLM response. Replace with actual abc_response function."
-
-def query_system(query, pdf_dir=None, dense_model=None, bm25_model=None, late_model=None):
-    """
-    End-to-end query system for hybrid RAG
-    """
-    # Load models if not provided
-    if not dense_model or not bm25_model or not late_model:
-        dense_model, bm25_model, late_model = load_embedding_models()
-    
-    # Perform hybrid search
-    results = hybrid_search(query, dense_model, bm25_model, late_model)
-    
-    # Format context and get sources
-    context, sources = format_context_from_results(results)
-    
-    # Generate LLM response
-    llm_response, sources = generate_response(query, context, sources)
-    
-    # Display results with simplified sources
-    print("\n===== LLM RESPONSE =====")
-    print(llm_response)
-    print("\n===== SOURCES =====")
-    for i, source in enumerate(sources):
-        print(f"{i+1}. Title: {source['title']} | Page: {source['page_num']} | Relevance: {source['score']}")
-        print(f"   File: {source['filename']}")
-        print(f"   Snippet: {source['content_snippet']}\n")
-    
-    return {
-        "query": query,
-        "response": llm_response,
-        "sources": sources
-    }
 
 def main():
-    """
-    Main function demonstrating the complete hybrid RAG workflow
-    """
-    # Set path to PDF directory
-    pdf_dir = "./documents"  # Change this to your PDF directory path
+    # Initialize BestRAG with local persistence
+    rag = BestRAG(
+        path="./qdrant_data",
+        collection_name="documents"
+    )
     
-    # Set up collection
-    setup_collection()
+    # Example of indexing a PDF
+    # rag.store_pdf_embeddings(
+    #    pdf_path="example.pdf",
+    #    pdf_name="Example Document"
+    # )
     
-    # Load embedding models
-    dense_model, bm25_model, late_model = load_embedding_models()
+    # Query example
+    query = input("Enter your query: ")
     
-    # Check if we should index documents
-    should_index = input("Index documents from PDF directory? (y/n): ").lower() == 'y'
+    # Get search results
+    search_results = rag.search(query, limit=5)
     
-    if should_index:
-        # Process and store PDFs
-        process_pdf_directory(pdf_dir, dense_model, bm25_model, late_model)
+    # Print results with source and relevance score
+    print("\nSearch Results:")
+    print("-" * 50)
     
-    # Interactive query loop
-    while True:
-        # Get query from user
-        query = input("\nEnter your question (or 'exit' to quit): ")
-        if query.lower() in ["exit", "quit", "q"]:
-            break
-            
-        # Process query
-        query_system(query, pdf_dir, dense_model, bm25_model, late_model)
+    contexts = []
+    for i, result in enumerate(search_results):
+        print(f"Result {i+1}:")
+        print(f"Source: {result.payload.get('pdf_name')}, Page: {result.payload.get('page_number')}")
+        print(f"Relevance Score: {result.score:.4f}")
+        print(f"Text: {result.payload.get('text')[:200]}...")
+        print("-" * 50)
+        
+        # Collect context for LLM
+        contexts.append(result.payload.get('text'))
+    
+    # Create prompt for LLM
+    if contexts:
+        prompt = f"""
+        Based on the following contexts, please answer the query: "{query}"
+        
+        Contexts:
+        {' '.join(contexts)}
+        
+        Answer:
+        """
+        
+        # Call LLM (placeholder function)
+        response = abc_response(prompt)
+        
+        # Print LLM response
+        print("\nLLM Response:")
+        print(response)
+
 
 if __name__ == "__main__":
     main()
