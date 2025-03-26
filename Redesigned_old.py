@@ -12,7 +12,6 @@ import hashlib
 import os
 from pathlib import Path
 import io
-import base64
 from datetime import datetime
 
 # Flag to determine which vector database to use
@@ -44,87 +43,44 @@ def load_css():
             margin: 1rem 0;
             background-color: white;
         }
-        .upload-section {
-            border: 2px dashed #aaa;
-            border-radius: 10px;
-            padding: 20px;
-            text-align: center;
-            margin: 10px 0;
-        }
-        .metrics-card {
+        .pdf-list {
             background-color: white;
-            padding: 15px;
-            border-radius: 10px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            margin: 10px 0;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 5px 0;
         }
         </style>
     """, unsafe_allow_html=True)
 
-# Initialize app
-st.set_page_config(
-    page_title="Advanced RAG PDF Chat",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# Page configuration
+st.set_page_config(page_title="RAG PDF Chat", layout="wide")
 load_css()
+st.title("📚 Chat with Multiple PDFs using Local LLM")
 
-# Page header with custom styling
-st.markdown("""
-    <div style='text-align: center; padding: 20px;'>
-        <h1>📚 Advanced PDF Chat Assistant</h1>
-        <p style='color: #666;'>Upload multiple PDFs and chat with your documents using advanced RAG</p>
-    </div>
-""", unsafe_allow_html=True)
-
-# Sidebar configuration
+# Sidebar for PDF upload
 with st.sidebar:
-    st.markdown("### 🛠️ Configuration")
-    
-    # PDF Management Section
-    st.markdown("#### 📁 Document Management")
-    uploaded_files = st.file_uploader(
-        "Upload PDF files",
-        type="pdf",
-        accept_multiple_files=True,
-        help="You can upload multiple PDF files"
-    )
+    st.header("📁 Upload PDFs")
+    uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
     
     if uploaded_files:
         st.success(f"📥 {len(uploaded_files)} files uploaded")
-        
-        # Display uploaded files with timestamps
-        st.markdown("#### 📋 Uploaded Documents")
+        # Display uploaded files
+        st.markdown("### 📋 Uploaded Files")
         for file in uploaded_files:
-            col1, col2 = st.columns([3,1])
-            with col1:
-                st.write(f"📄 {file.name}")
-            with col2:
-                st.write(datetime.now().strftime("%H:%M"))
+            st.markdown(f"""
+                <div class='pdf-list'>
+                    📄 {file.name}<br>
+                    <small>{datetime.now().strftime('%H:%M:%S')}</small>
+                </div>
+            """, unsafe_allow_html=True)
     
-    # Chat Management
-    st.markdown("#### 💬 Chat Management")
-    if st.button("🗑️ Clear Chat History"):
+    if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
         if USE_FAISS:
             st.session_state.retriever = None
         else:
             st.session_state.collection_name = None
-        st.success("Chat history cleared!")
         st.rerun()
-    
-    # Display Metrics
-    st.markdown("#### 📊 Chat Metrics")
-    if "messages" in st.session_state:
-        total_messages = len(st.session_state.messages)
-        user_messages = len([m for m in st.session_state.messages if m["role"] == "user"])
-        st.markdown(f"""
-            <div class='metrics-card'>
-                <p>Total Messages: {total_messages}</p>
-                <p>User Queries: {user_messages}</p>
-            </div>
-        """, unsafe_allow_html=True)
 
 # Initialize session state
 if "messages" not in st.session_state:
@@ -133,28 +89,144 @@ if USE_FAISS and "retriever" not in st.session_state:
     st.session_state.retriever = None
 if not USE_FAISS and "collection_name" not in st.session_state:
     st.session_state.collection_name = None
-if "processed_files" not in st.session_state:
-    st.session_state.processed_files = set()
 
-# Keep the existing helper functions (load_sentence_transformer, setup_qdrant_client, etc.)
-[Previous helper functions remain exactly the same]
+# Initialize the embedding model for Qdrant
+@st.cache_resource
+def load_sentence_transformer():
+    """Initialize the embedding model from local path or download if not present."""
+    try:
+        with st.spinner("Loading embedding model..."):
+            model = SentenceTransformer(LOCAL_MODEL_PATH)
+            st.success("✅ Model loaded from local path")
+    except Exception as e:
+        with st.spinner(f"Model not found locally or error loading. Downloading model (this may take a moment)..."):
+            model = SentenceTransformer('all-MiniLM-L6-v2')
+            os.makedirs(LOCAL_MODEL_PATH, exist_ok=True)
+            model.save(LOCAL_MODEL_PATH)
+            st.success("✅ Model downloaded and saved locally")
+    return model
 
-# Modified PDF processing to handle multiple files
-def process_multiple_pdfs(uploaded_files):
-    combined_hash = ""
-    combined_text = ""
-    
-    for uploaded_file in uploaded_files:
-        file_bytes = uploaded_file.getvalue()
-        file_hash = hashlib.md5(file_bytes).hexdigest()
-        combined_hash += file_hash
+# Setup Qdrant client
+@st.cache_resource
+def setup_qdrant_client():
+    """Setup Qdrant client with local persistence."""
+    try:
+        client = QdrantClient(path=str(VECTORDB_DIR / "qdrant_db"))
+        return client
+    except Exception as e:
+        st.error(f"Error connecting to Qdrant: {e}")
+        return None
+
+# Create collection for the PDF if it doesn't exist (Qdrant)
+def create_collection(client, collection_name, vector_size=384):
+    """Create a new collection if it doesn't exist."""
+    try:
+        collections = client.get_collections().collections
+        collection_names = [collection.name for collection in collections]
         
-        # Extract text from PDF
+        if collection_name not in collection_names:
+            client.create_collection(
+                collection_name=collection_name,
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
+            )
+            st.success(f"✅ Collection '{collection_name}' created")
+        else:
+            st.info(f"Using existing collection '{collection_name}'")
+    except Exception as e:
+        st.error(f"Error creating collection: {e}")
+
+# Process PDF and add to Qdrant
+def process_pdf_qdrant(file_bytes, collection_name):
+    try:
+        # Extract text
         reader = PdfReader(io.BytesIO(file_bytes))
+        text = ""
         for page in reader.pages:
-            combined_text += page.extract_text() + "\n"
+            text += page.extract_text() + "\n"
+        
+        # Split text
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        chunks = text_splitter.split_text(text)
+        
+        # Get model and client
+        model = load_sentence_transformer()
+        qdrant_client = setup_qdrant_client()
+        
+        # Create embeddings for chunks
+        embeddings = model.encode(chunks)
+        
+        # Check if collection exists and has points
+        collection_info = qdrant_client.get_collection(collection_name)
+        existing_count = collection_info.points_count
+        
+        # Skip if chunks are already added
+        if existing_count > 0:
+            st.info(f"Document chunks already added to collection (found {existing_count} points)")
+            return
+        
+        # Prepare points for upload
+        points = [
+            models.PointStruct(
+                id=idx,
+                vector=embedding.tolist(),
+                payload={"text": chunk, "chunk_id": idx}
+            )
+            for idx, (embedding, chunk) in enumerate(zip(embeddings, chunks))
+        ]
+        
+        # Upload to collection
+        qdrant_client.upsert(
+            collection_name=collection_name,
+            points=points
+        )
+        
+        st.success(f"✅ Added {len(points)} chunks to collection")
+    except Exception as e:
+        st.error(f"Error processing PDF: {e}")
+        raise e
+
+# Search for relevant chunks in Qdrant
+def search_chunks(collection_name, query, limit=4):
+    """Search for chunks similar to the query."""
+    try:
+        # Get model and client
+        model = load_sentence_transformer()
+        qdrant_client = setup_qdrant_client()
+        
+        # Generate embedding for query
+        query_embedding = model.encode([query])[0]
+        
+        # Search in collection
+        search_results = qdrant_client.search(
+            collection_name=collection_name,
+            query_vector=query_embedding.tolist(),
+            limit=limit
+        )
+        
+        return [result.payload["text"] for result in search_results]
+    except Exception as e:
+        st.error(f"Error searching chunks: {e}")
+        return []
+
+# Process multiple PDFs
+def process_multiple_pdfs(uploaded_files):
+    combined_text = ""
+    combined_hash = ""
+    
+    with st.spinner("Processing PDFs..."):
+        for file in uploaded_files:
+            file_bytes = file.getvalue()
+            file_hash = hashlib.md5(file_bytes).hexdigest()
+            combined_hash += file_hash
             
-        st.sidebar.success(f"✅ Processed: {uploaded_file.name}")
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for page in reader.pages:
+                combined_text += page.extract_text() + "\n"
+            
+            st.success(f"✅ Processed {file.name}")
     
     final_hash = hashlib.md5(combined_hash.encode()).hexdigest()
     return final_hash, combined_text
@@ -164,99 +236,65 @@ if uploaded_files:
     combined_hash, combined_text = process_multiple_pdfs(uploaded_files)
     
     if USE_FAISS:
-        # FAISS Implementation for multiple PDFs
+        # FAISS Implementation
         cache_file = VECTORDB_DIR / f"{combined_hash}.pkl"
         
         if st.session_state.retriever is None:
             with st.spinner("Processing PDFs with FAISS..."):
-                # Load from cache if exists
                 if cache_file.exists():
                     try:
                         with open(cache_file, "rb") as f:
                             vector_store = pickle.load(f)
                         st.session_state.retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-                        st.success("✅ Loaded from cache")
+                        st.success("Loaded from cache")
                     except Exception as e:
                         st.error(f"Error loading cache: {e}")
                 
-                # Process if not in cache
                 if st.session_state.retriever is None:
                     try:
-                        # Split text
                         text_splitter = RecursiveCharacterTextSplitter(
                             chunk_size=1000,
                             chunk_overlap=200
                         )
                         chunks = text_splitter.split_text(combined_text)
                         
-                        # Create embeddings and vector store
                         embeddings = HuggingFaceEmbeddings(
                             model_name="sentence-transformers/all-mpnet-base-v2"
                         )
                         
                         vector_store = FAISS.from_texts(chunks, embeddings)
                         
-                        # Save to cache
                         with open(cache_file, "wb") as f:
                             pickle.dump(vector_store, f)
                         
                         st.session_state.retriever = vector_store.as_retriever(search_kwargs={"k": 4})
-                        st.success("✅ PDFs processed successfully!")
+                        st.success("PDFs processed successfully with FAISS!")
                     except Exception as e:
-                        st.error(f"Error processing PDFs: {e}")
+                        st.error(f"Error processing PDFs with FAISS: {e}")
     else:
-        # Qdrant Implementation for multiple PDFs
+        # Qdrant Implementation
         collection_name = f"pdf_{combined_hash}"
         
         if st.session_state.collection_name != collection_name:
             with st.spinner("Processing PDFs with Qdrant..."):
                 qdrant_client = setup_qdrant_client()
-                model = load_sentence_transformer()
-                
                 if qdrant_client:
-                    # Create collection
+                    model = load_sentence_transformer()
                     vector_size = model.get_sentence_embedding_dimension()
                     create_collection(qdrant_client, collection_name, vector_size)
-                    
-                    # Process text
-                    text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=200
-                    )
-                    chunks = text_splitter.split_text(combined_text)
-                    
-                    # Create embeddings
-                    embeddings = model.encode(chunks)
-                    
-                    # Prepare points
-                    points = [
-                        models.PointStruct(
-                            id=idx,
-                            vector=embedding.tolist(),
-                            payload={"text": chunk, "chunk_id": idx}
-                        )
-                        for idx, (embedding, chunk) in enumerate(zip(embeddings, chunks))
-                    ]
-                    
-                    # Upload to collection
-                    qdrant_client.upsert(
-                        collection_name=collection_name,
-                        points=points
-                    )
-                    
+                    process_pdf_qdrant(combined_text.encode(), collection_name)
                     st.session_state.collection_name = collection_name
-                    st.success("✅ PDFs processed successfully!")
+                    st.success("PDFs processed successfully with Qdrant!")
+                else:
+                    st.error("Failed to initialize Qdrant client")
 
-# Enhanced chat interface
-st.markdown("### 💬 Chat Interface")
-
-# Display chat messages with enhanced styling
+# Display chat messages
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         
         if "sources" in message and message["sources"]:
-            with st.expander("📚 View Sources", expanded=False):
+            with st.expander("📚 View Sources"):
                 for i, source in enumerate(message["sources"]):
                     st.markdown(f"""
                         <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
@@ -264,36 +302,24 @@ for message in st.session_state.messages:
                         </div>
                     """, unsafe_allow_html=True)
 
-# Enhanced chat input
-if prompt := st.chat_input("💭 Ask a question about your documents..."):
-    # Add user message
+# Chat input
+if prompt := st.chat_input("💭 Ask about your PDFs..."):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)
     
-    # Check if documents are uploaded
-    if (USE_FAISS and st.session_state.retriever is None) or \
-       (not USE_FAISS and st.session_state.collection_name is None):
-        with st.chat_message("assistant"):
-            st.warning("⚠️ Please upload PDF documents first.")
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "⚠️ Please upload PDF documents first."
-        })
-    else:
-        with st.spinner("🤔 Thinking..."):
-            try:
-                # Get relevant chunks
-                if USE_FAISS:
+    if USE_FAISS:
+        if st.session_state.retriever is None:
+            with st.chat_message("assistant"):
+                st.warning("⚠️ Please upload PDF files first.")
+            st.session_state.messages.append({"role": "assistant", "content": "Please upload PDF files first."})
+        else:
+            with st.spinner("Thinking..."):
+                try:
                     docs = st.session_state.retriever.get_relevant_documents(prompt)
                     sources = [doc.page_content for doc in docs]
-                else:
-                    sources = search_chunks(st.session_state.collection_name, prompt)
-                
-                if not sources:
-                    response = "I couldn't find relevant information in the documents. Please try rephrasing your question."
-                else:
                     context = "\n\n".join(sources)
+                    
                     full_prompt = f"""
                     Answer the following question based on the provided context.
                     
@@ -305,34 +331,86 @@ if prompt := st.chat_input("💭 Ask a question about your documents..."):
                     Answer:
                     """
                     
-                    # Get response from custom LLM function
                     response = abc_response(full_prompt) if 'abc_response' in globals() else \
                              f"Using local LLM to answer: {prompt}\n\nBased on the documents, I found relevant information that would help answer this question."
-                
-                # Display response
-                with st.chat_message("assistant"):
-                    st.markdown(response)
-                    if sources:
-                        with st.expander("📚 View Sources", expanded=False):
+                    
+                    with st.chat_message("assistant"):
+                        st.markdown(response)
+                        with st.expander("📚 View Sources"):
                             for i, source in enumerate(sources):
                                 st.markdown(f"""
                                     <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
                                         <strong>Source {i+1}:</strong><br>{source}
                                     </div>
                                 """, unsafe_allow_html=True)
-                
-                # Add to chat history
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response,
-                    "sources": sources if sources else []
-                })
-                
-            except Exception as e:
-                error_message = f"❌ Error generating response: {str(e)}"
-                with st.chat_message("assistant"):
-                    st.error(error_message)
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": error_message
-                })
+                    
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": response,
+                        "sources": sources
+                    })
+                    
+                except Exception as e:
+                    error_message = f"Error generating response: {str(e)}"
+                    with st.chat_message("assistant"):
+                        st.error(error_message)
+                    st.session_state.messages.append({"role": "assistant", "content": error_message})
+    else:
+        if st.session_state.collection_name is None:
+            with st.chat_message("assistant"):
+                st.warning("⚠️ Please upload PDF files first.")
+            st.session_state.messages.append({"role": "assistant", "content": "Please upload PDF files first."})
+        else:
+            with st.spinner("Thinking..."):
+                try:
+                    sources = search_chunks(st.session_state.collection_name, prompt)
+                    
+                    if not sources:
+                        with st.chat_message("assistant"):
+                            st.warning("I couldn't find relevant information in the documents. Please try rephrasing your question.")
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": "I couldn't find relevant information in the documents. Please try rephrasing your question."
+                        })
+                    else:
+                        context = "\n\n".join(sources)
+                        full_prompt = f"""
+                        Answer the following question based on the provided context.
+                        
+                        Context:
+                        {context}
+                        
+                        Question: {prompt}
+                        
+                        Answer:
+                        """
+                        
+                        # Get response from your custom LLM function
+                        response = abc_response(full_prompt) if 'abc_response' in globals() else \
+                                 f"Using local LLM to answer: {prompt}\n\nBased on the documents, I found relevant information that would help answer this question."
+                        
+                        # Display assistant response
+                        with st.chat_message("assistant"):
+                            st.markdown(response)
+                            
+                            # Show sources
+                            with st.expander("📚 View Sources"):
+                                for i, source in enumerate(sources):
+                                    st.markdown(f"""
+                                        <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
+                                            <strong>Source {i+1}:</strong><br>{source}
+                                        </div>
+                                    """, unsafe_allow_html=True)
+                        
+                        # Add assistant message to chat history
+                        st.session_state.messages.append({
+                            "role": "assistant", 
+                            "content": response,
+                            "sources": sources
+                        })
+                    
+                except Exception as e:
+                    error_message = f"Error generating response: {str(e)}"
+                    with st.chat_message("assistant"):
+                        st.error(error_message)
+                    st.session_state.messages.append({"role": "assistant", "content": error_message})
