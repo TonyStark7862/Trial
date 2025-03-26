@@ -43,11 +43,14 @@ with st.sidebar:
     st.header("📁 Upload PDFs")
     uploaded_files = st.file_uploader("Choose PDF files", type="pdf", accept_multiple_files=True)
     
+    # Handle both single and multiple files
     if uploaded_files:
-        st.success(f"📥 {len(uploaded_files)} files uploaded")
+        num_files = len(uploaded_files) if isinstance(uploaded_files, list) else 1
+        st.success(f"📥 {num_files} {'files' if num_files > 1 else 'file'} uploaded")
         # Display uploaded files
         st.markdown("### 📋 Uploaded Files")
-        for file in uploaded_files:
+        files_to_display = uploaded_files if isinstance(uploaded_files, list) else [uploaded_files]
+        for file in files_to_display:
             st.text(f"📄 {file.name} ({datetime.now().strftime('%H:%M:%S')})")
     
     if st.button("🗑️ Clear Chat"):
@@ -114,7 +117,11 @@ def create_collection(client, collection_name, vector_size=384):
 # Process PDF and add to Qdrant
 def process_pdf_qdrant(file_bytes, collection_name):
     try:
-        # Extract text
+        # Check for EOF marker if this is a single PDF
+        if isinstance(file_bytes, bytes) and b'%%EOF' not in file_bytes:
+            st.error("Error: PDF file is corrupted (EOF marker not found)")
+            raise ValueError("PDF file is corrupted")
+            
         reader = PdfReader(io.BytesIO(file_bytes))
         text = ""
         for page in reader.pages:
@@ -194,13 +201,27 @@ def process_multiple_pdfs(uploaded_files):
     
     with st.spinner("Processing PDFs..."):
         for file in uploaded_files:
-            file_bytes = file.getvalue()
-            file_hash = hashlib.md5(file_bytes).hexdigest()
-            combined_hash += file_hash
-            
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for page in reader.pages:
-                combined_text += page.extract_text() + "\n"
+            try:
+                file_bytes = file.getvalue()
+                # Check for EOF marker in PDF
+                if b'%%EOF' not in file_bytes:
+                    st.error(f"Error: PDF file {file.name} is corrupted (EOF marker not found)")
+                    return None, None
+                    
+                file_hash = hashlib.md5(file_bytes).hexdigest()
+                combined_hash += file_hash
+                
+                reader = PdfReader(io.BytesIO(file_bytes))
+                for page in reader.pages:
+                    combined_text += page.extract_text() + "\n"
+                
+                st.success(f"✅ Processed {file.name}")
+            except Exception as e:
+                st.error(f"Error processing {file.name}: {str(e)}")
+                return None, None
+    
+    final_hash = hashlib.md5(combined_hash.encode()).hexdigest()
+    return final_hash, combined_text
             
             st.success(f"✅ Processed {file.name}")
     
