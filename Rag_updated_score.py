@@ -122,26 +122,32 @@ final_results = client.query_points(
 dense_scores = {hit.id: hit.score for hit in dense_results}
 sparse_scores = {hit.id: hit.score for hit in sparse_results}
 
-# Display results in standard Qdrant format
-print("\nSearch Results:")
-print("-" * 50)
-print(f"Query: {query}")
-print("-" * 50)
+# First print the raw results to see their format
+print(f"Top {len(final_results)} Reranked Results:")
+print(f"points={final_results}")
 
+# Then display the formatted results (corrected to match the error in your screenshot)
 for idx, hit in enumerate(final_results):
-    doc_id = hit.payload['doc_id']
-    
-    # Get source scores
-    dense_score = dense_scores.get(doc_id, None)
-    sparse_score = sparse_scores.get(doc_id, None)
-    
-    # Print result in Qdrant standard format
-    print(f"\n{idx+1}. Score: {hit.score:.4f}")
-    print(f"   Text: {hit.payload['text'][:150]}...")
-    
-    # Print source scores in the standard format used in Qdrant examples
-    print(f"   Source scores:")
-    print(f"     dense: {dense_score:.4f}" if dense_score is not None else "     dense: not in top 5")
-    print(f"     sparse: {sparse_score:.4f}" if sparse_score is not None else "     sparse: not in top 5")
-    print(f"     colbert: {hit.score:.4f} (final)")
-    print("-" * 50)
+    try:
+        # Original line causing the error
+        # print(f"{idx+1}. {hit.payload['text']}\nScore: {hit.score:.4f}")
+        
+        # Fixed approach - checking the structure first
+        print(f"{idx+1}. ", end="")
+        # If hit is a ScoredPoint object with a payload attribute
+        if hasattr(hit, 'payload') and 'text' in hit.payload:
+            print(f"{hit.payload['text']}")
+            print(f"Score: {hit.score:.4f}")
+        # If hit is a tuple (id, score, payload)
+        elif isinstance(hit, tuple) and len(hit) >= 3:
+            if isinstance(hit[2], dict) and 'text' in hit[2]:
+                print(f"{hit[2]['text']}")
+                print(f"Score: {hit[1]:.4f}")
+            else:
+                print(f"Result structure: {hit}")
+        else:
+            print(f"Unexpected result format: {hit}")
+    except Exception as e:
+        print(f"Error displaying result {idx+1}: {e}")
+        print(f"Result type: {type(hit)}")
+        print(f"Result content: {hit}")
