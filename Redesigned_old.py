@@ -27,27 +27,8 @@ os.makedirs(os.path.dirname(LOCAL_MODEL_PATH), exist_ok=True)
 def load_css():
     st.markdown("""
         <style>
-        .main {
-            padding: 0rem 1rem;
-        }
-        .stApp {
-            background-color: #f5f5f5;
-        }
-        .css-1d391kg {
-            padding-top: 1rem;
-        }
-        .stChat {
-            border-radius: 10px;
-            border: 1px solid #e0e0e0;
-            padding: 1rem;
-            margin: 1rem 0;
-            background-color: white;
-        }
-        .pdf-list {
-            background-color: white;
-            padding: 10px;
-            border-radius: 5px;
-            margin: 5px 0;
+        .st-emotion-cache-16idsys {
+            font-size: 1.2rem;
         }
         </style>
     """, unsafe_allow_html=True)
@@ -67,12 +48,7 @@ with st.sidebar:
         # Display uploaded files
         st.markdown("### 📋 Uploaded Files")
         for file in uploaded_files:
-            st.markdown(f"""
-                <div class='pdf-list'>
-                    📄 {file.name}<br>
-                    <small>{datetime.now().strftime('%H:%M:%S')}</small>
-                </div>
-            """, unsafe_allow_html=True)
+            st.text(f"📄 {file.name} ({datetime.now().strftime('%H:%M:%S')})")
     
     if st.button("🗑️ Clear Chat"):
         st.session_state.messages = []
@@ -296,11 +272,7 @@ for message in st.session_state.messages:
         if "sources" in message and message["sources"]:
             with st.expander("📚 View Sources"):
                 for i, source in enumerate(message["sources"]):
-                    st.markdown(f"""
-                        <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
-                            <strong>Source {i+1}:</strong><br>{source}
-                        </div>
-                    """, unsafe_allow_html=True)
+                    st.markdown(f"**Source {i+1}:**\n{source}\n---")
 
 # Chat input
 if prompt := st.chat_input("💭 Ask about your PDFs..."):
@@ -396,11 +368,7 @@ if prompt := st.chat_input("💭 Ask about your PDFs..."):
                             # Show sources
                             with st.expander("📚 View Sources"):
                                 for i, source in enumerate(sources):
-                                    st.markdown(f"""
-                                        <div style='background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin: 5px 0;'>
-                                            <strong>Source {i+1}:</strong><br>{source}
-                                        </div>
-                                    """, unsafe_allow_html=True)
+                                    st.markdown(f"**Source {i+1}:**\n{source}\n---")
                         
                         # Add assistant message to chat history
                         st.session_state.messages.append({
