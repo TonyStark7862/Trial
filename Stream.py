@@ -155,15 +155,23 @@ if 'rag_initialized' in st.session_state:
         # Get relevant documents
         results = perform_hybrid_search(user_query, client, dense_model, sparse_model, colbert_model)
         
-        # Extract sources
-        sources = [
-            {
-                'file_name': result.payload['metadata']['file_name'],
-                'page_number': result.payload['metadata']['page_number'],
-                'text': result.payload['text']
-            }
-            for result in results
-        ]
+        # Extract results using model_dump()
+        points_list = results.model_dump()['points']
+        extracted_data = [(point['payload']['text'], point['score']) for point in points_list]
+        
+        # Extract sources with scores
+        sources = []
+        for text, score in extracted_data:
+            # Find the corresponding metadata
+            for result in results:
+                if result.payload['text'] == text:
+                    sources.append({
+                        'file_name': result.payload['metadata']['file_name'],
+                        'page_number': result.payload['metadata']['page_number'],
+                        'text': text,
+                        'score': score
+                    })
+                    break
 
         # Generate context for LLM
         context = "\n".join([f"Content from {s['file_name']}, Page {s['page_number']}: {s['text']}" for s in sources])
@@ -180,6 +188,9 @@ if 'rag_initialized' in st.session_state:
             st.write("Sources:")
             for source in sources:
                 st.write(f"- {source['file_name']}, Page {source['page_number']}")
+                st.write(f"  Text: {source['text']}")
+                st.write(f"  Score: {source['score']:.4f}")
+                st.write("-" * 50)
 
         # Update chat history
         st.session_state.chat_history.append({
