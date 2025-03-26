@@ -147,16 +147,18 @@ final_results = client.query_points(
 print("Top 3 Reranked Results:")
 print(f"points={final_results}")
 
-# Extract points from results (handling different possible formats)
-points = final_results
+# Process the results for display
 if isinstance(final_results, tuple) and len(final_results) > 1 and final_results[0] == 'points':
-    points = final_results[1]
-
-# Now display each result with formatted text and score
-for idx, point in enumerate(points):
-    try:
-        print(f"{idx+1}. {point.payload['text']}")
-        print(f"Score: {point.score:.4f}")
-    except Exception as e:
-        print(f"Error displaying result {idx+1}: {e}")
-        print(f"Result structure: {point}")
+    # The results are in the format ('points', [ScoredPoint, ...])
+    points_list = final_results[1]
+    
+    # Now iterate through the list of ScoredPoint objects
+    for idx, point in enumerate(points_list):
+        print(f"{idx+1}. {point.payload['text']}\nScore: {point.score:.4f}")
+else:
+    # Handle case where results might be a direct list
+    for idx, point in enumerate(final_results):
+        try:
+            print(f"{idx+1}. {point.payload['text']}\nScore: {point.score:.4f}")
+        except AttributeError:
+            print(f"Error: Unexpected result format: {point}")
