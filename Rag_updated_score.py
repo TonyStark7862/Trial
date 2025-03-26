@@ -122,16 +122,8 @@ final_results = client.query_points(
 dense_scores = {hit.id: hit.score for hit in dense_results}
 sparse_scores = {hit.id: hit.score for hit in sparse_results}
 
-# Test query about feature engineering
-query = "How to prepare features for machine learning models?"
-
-# Generate query embeddings
-dense_query = next(dense_model.query_embed(query))
-sparse_query = next(sparse_model.query_embed(query))
-colbert_query = next(colbert_model.query_embed(query))
-
-# Hybrid search with reranking using query_points
-results = client.query_points(
+# Hybrid search with reranking using only query_points
+final_results = client.query_points(
     collection_name="ml-docs",
     prefetch=[
         models.Prefetch(
@@ -151,30 +143,20 @@ results = client.query_points(
     with_payload=True
 )
 
-# Print results in the format shown in your screenshot
-print(f"Top {3} Reranked Results:")
+# Display results
+print("Top 3 Reranked Results:")
+print(f"points={final_results}")
 
-# Based on the screenshot, results appears to be in format ('points', [ScoredPoint, ScoredPoint, ...])
-if isinstance(results, tuple) and len(results) == 2 and results[0] == 'points':
-    # Extract the list of ScoredPoint objects
-    scored_points = results[1]
-    print(f"points={scored_points}")
-    
-    # Display the individual results
-    for idx, point in enumerate(scored_points):
+# Extract points from results (handling different possible formats)
+points = final_results
+if isinstance(final_results, tuple) and len(final_results) > 1 and final_results[0] == 'points':
+    points = final_results[1]
+
+# Now display each result with formatted text and score
+for idx, point in enumerate(points):
+    try:
         print(f"{idx+1}. {point.payload['text']}")
         print(f"Score: {point.score:.4f}")
-else:
-    # If the format is different, try to handle it directly
-    print(f"points={results}")
-    
-    # Try to iterate through results however they're structured
-    if hasattr(results, '__iter__'):
-        for idx, item in enumerate(results):
-            if hasattr(item, 'payload') and 'text' in item.payload:
-                print(f"{idx+1}. {item.payload['text']}")
-                print(f"Score: {item.score:.4f}")
-            else:
-                print(f"{idx+1}. Unexpected format: {item}")
-    else:
-        print("Results in unexpected format, cannot display.")
+    except Exception as e:
+        print(f"Error displaying result {idx+1}: {e}")
+        print(f"Result structure: {point}")
